@@ -3,12 +3,13 @@ name: Build
 on:
   push:
     branches: [ main ]
-    tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
+  release:
+    types: [ published ]   # publishing a release on GitHub builds GEX.exe and attaches it
 
 permissions:
-  contents: write   # needed to publish releases for version tags
+  contents: write   # needed to upload the release asset
 
 jobs:
   windows-x64:
@@ -30,13 +31,13 @@ jobs:
             LICENSE
 
       - name: Package release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'release'
         shell: pwsh
-        run: Compress-Archive -Path bin/Release/GEX.exe, README.md, LICENSE -DestinationPath "GEX-${{ github.ref_name }}-win-x64.zip"
+        run: Compress-Archive -Path bin/Release/GEX.exe, README.md, LICENSE -DestinationPath "GEX-${{ github.event.release.tag_name }}-win-x64.zip"
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.release.tag_name }}
           files: GEX-*-win-x64.zip
-          generate_release_notes: true

@@ -453,6 +453,162 @@ namespace gex::shell
         return hr == DRAGDROP_S_DROP ? (uint32_t)effect : 0u;
     }
 
+    // ------------------------------------------------------------------ Recycle Bin
+    RecycleBinInfo QueryRecycleBin(const std::vector<std::wstring>& driveRoots)
+    {
+        const HRESULT hrInit = ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        RecycleBinInfo info;
+        const UINT oldMode = ::SetErrorMode(SEM_FAILCRITICALERRORS);
+        for (const auto& root : driveRoots)
+        {
+            SHQUERYRBINFO rb{};
+            rb.cbSize = sizeof(rb);
+            if (SUCCEEDED(::SHQueryRecycleBinW(root.c_str(), &rb)) && rb.i64NumItems > 0)
+            {
+                info.size += (uint64_t)rb.i64Size;
+                info.count += (uint64_t)rb.i64NumItems;
+                info.driveSize.push_back({ root, (uint64_t)rb.i64Size });
+                info.driveCount.push_back({ root, (uint64_t)rb.i64NumItems });
+            }
+        }
+        ::SetErrorMode(oldMode);
+        if (SUCCEEDED(hrInit)) ::CoUninitialize();
+        return info;
+    }
+
+    bool EmptyRecycleBin(const std::wstring& root)
+    {
+        // GEX asks for confirmation itself; keep the Windows progress dialog and sound.
+        const HRESULT hr = ::SHEmptyRecycleBinW(g_hwnd, root.empty() ? nullptr : root.c_str(), SHERB_NOCONFIRMATION);
+        return SUCCEEDED(hr) || hr == E_UNEXPECTED; // E_UNEXPECTED: it was already empty
+    }
+
+    bool OpenRecycleBin()
+    {
+        HINSTANCE r = ::ShellExecuteW(g_hwnd, L"open", L"shell:RecycleBinFolder", nullptr, nullptr, SW_SHOWNORMAL);
+        return (INT_PTR)r > 32;
+    }
+
+    // ------------------------------------------------------------------ drop target (files dropped onto GEX)
+    class DropTarget final : public IDropTarget
+    {
+    public:
+        explicit DropTarget(DropHandler* h) : m_handler(h)
+        {
+            ::CoCreateInstance(CLSID_DragDropHelper, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&m_helper)); // Explorer-style drag images
+        }
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+        {
+            if (riid == IID_IUnknown || riid == IID_IDropTarget) { *ppv = static_cast<IDropTarget*>(this); AddRef(); return S_OK; }
+            *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+        ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)::InterlockedIncrement(&m_ref); }
+        ULONG STDMETHODCALLTYPE Release() override
+        {
+            const LONG r = ::InterlockedDecrement(&m_ref);
+            if (r == 0) delete this;
+            return (ULONG)r;
+        }
+        HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* obj, DWORD keys, POINTL pt, DWORD* effect) override
+        {
+            m_paths = PathsFrom(obj);
+            m_allowed = *effect;
+            *effect = Compute(keys, pt);
+            if (m_helper) { POINT p{ pt.x, pt.y }; m_helper->DragEnter(g_hwnd, obj, &p, *effect); }
+            return S_OK;
+        }
+        HRESULT STDMETHODCALLTYPE DragOver(DWORD keys, POINTL pt, DWORD* effect) override
+        {
+            *effect = Compute(keys, pt);
+            if (m_helper) { POINT p{ pt.x, pt.y }; m_helper->DragOver(&p, *effect); }
+            return S_OK;
+        }
+        HRESULT STDMETHODCALLTYPE DragLeave() override
+        {
+            if (m_helper) m_helper->DragLeave();
+            m_paths.clear();
+            m_handler->OnDragLeave();
+            return S_OK;
+        }
+        HRESULT STDMETHODCALLTYPE Drop(IDataObject* obj, DWORD keys, POINTL pt, DWORD* effect) override
+        {
+            if (m_paths.empty()) m_paths = PathsFrom(obj);
+            const DWORD e = Compute(keys, pt);
+            if (m_helper) { POINT p{ pt.x, pt.y }; m_helper->Drop(obj, &p, e); }
+            POINT c{ pt.x, pt.y };
+            ::ScreenToClient(g_hwnd, &c);
+            if (e != DROPEFFECT_NONE) m_handler->OnDrop(m_paths, c.x, c.y, keys, e);
+            m_paths.clear();
+            // GEX performs moves itself ("optimized move"): never let the source delete the originals.
+            *effect = e == DROPEFFECT_MOVE ? DROPEFFECT_NONE : e;
+            return S_OK;
+        }
+
+    private:
+        DWORD Compute(DWORD keys, POINTL pt)
+        {
+            if (m_paths.empty()) return DROPEFFECT_NONE;
+            POINT c{ pt.x, pt.y };
+            ::ScreenToClient(g_hwnd, &c);
+            DWORD e = m_handler->OnDragOver(m_paths, c.x, c.y, keys, m_allowed) & m_allowed;
+            if (e & DROPEFFECT_MOVE) return DROPEFFECT_MOVE;
+            if (e & DROPEFFECT_COPY) return DROPEFFECT_COPY;
+            if (e & DROPEFFECT_LINK) return DROPEFFECT_LINK;
+            return DROPEFFECT_NONE;
+        }
+        static std::vector<std::wstring> PathsFrom(IDataObject* obj)
+        {
+            std::vector<std::wstring> out;
+            FORMATETC fe{ CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+            STGMEDIUM sm{};
+            if (!obj || FAILED(obj->GetData(&fe, &sm))) return out;
+            if (HDROP hDrop = (HDROP)::GlobalLock(sm.hGlobal))
+            {
+                const UINT n = ::DragQueryFileW(hDrop, 0xFFFFFFFF, nullptr, 0);
+                for (UINT i = 0; i < n; ++i)
+                {
+                    const UINT len = ::DragQueryFileW(hDrop, i, nullptr, 0);
+                    std::wstring s(len, L'\0');
+                    ::DragQueryFileW(hDrop, i, s.data(), len + 1);
+                    out.push_back(s);
+                }
+                ::GlobalUnlock(sm.hGlobal);
+            }
+            ::ReleaseStgMedium(&sm);
+            return out;
+        }
+
+        LONG                         m_ref = 1;
+        DropHandler*                 m_handler;
+        ComPtr<IDropTargetHelper>    m_helper;
+        std::vector<std::wstring>    m_paths;
+        DWORD                        m_allowed = 0;
+    };
+
+    static DropTarget* g_dropTarget = nullptr;
+
+    bool RegisterDropTarget(DropHandler* handler)
+    {
+        if (g_dropTarget || !handler) return false;
+        g_dropTarget = new DropTarget(handler);
+        if (FAILED(::RegisterDragDrop(g_hwnd, g_dropTarget)))
+        {
+            g_dropTarget->Release();
+            g_dropTarget = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    void RevokeDropTarget()
+    {
+        if (!g_dropTarget) return;
+        ::RevokeDragDrop(g_hwnd);
+        g_dropTarget->Release();
+        g_dropTarget = nullptr;
+    }
+
     // ------------------------------------------------------------------ misc
     bool PickFolder(std::wstring& out)
     {

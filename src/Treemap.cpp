@@ -112,6 +112,7 @@ namespace gex
         ImGui::InvisibleButton(id, size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight);
         const bool hovered = ImGui::IsItemHovered();
         const ImVec2 o = ImGui::GetItemRectMin();
+        m_origin = o;
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(o, ImVec2(o.x + size.x, o.y + size.y), IM_COL32(18, 20, 28, 255));
         if (!tree || !root) return res;
@@ -205,5 +206,19 @@ namespace gex
         }
         dl->PopClipRect();
         return res;
+    }
+}
+
+namespace gex
+{
+    Node* Treemap::HitTest(ImVec2 p) const
+    {
+        const float x = p.x - m_origin.x, y = p.y - m_origin.y;
+        for (size_t i = m_rects.size(); i-- > 0;)
+        {
+            const Rect& r = m_rects[i];
+            if (x >= r.x0 && x < r.x1 && y >= r.y0 && y < r.y1 && !r.node->IsRemoved()) return r.node;
+        }
+        return nullptr;
     }
 }

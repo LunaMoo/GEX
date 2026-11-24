@@ -19,6 +19,8 @@ namespace gex::icons
     static std::unordered_map<std::string, ID3D11ShaderResourceView*> g_byExt;   // "" key for unknown
     static std::unordered_map<std::wstring, ID3D11ShaderResourceView*> g_byPath; // exe/ico/lnk... unique icons
     static ID3D11ShaderResourceView* g_folder = nullptr;
+    static ID3D11ShaderResourceView* g_recycle[2] = { nullptr, nullptr };
+    static bool g_recycleTried[2] = { false, false };
     static bool g_folderTried = false;
     static int g_budget = 0;
 
@@ -30,6 +32,7 @@ namespace gex::icons
         for (auto& kv : g_byPath) if (kv.second) kv.second->Release();
         g_byExt.clear(); g_byPath.clear();
         if (g_folder) { g_folder->Release(); g_folder = nullptr; }
+        for (auto& r : g_recycle) if (r) { r->Release(); r = nullptr; }
     }
 
     void NewFrame() { g_budget = 12; }
@@ -155,5 +158,25 @@ namespace gex::icons
         ID3D11ShaderResourceView* srv = Extract(root.c_str(), 0, false);
         g_byPath[root] = srv;
         return ToId(srv);
+    }
+}
+
+namespace gex::icons
+{
+    ImTextureID ForRecycleBin(bool full)
+    {
+        const int i = full ? 1 : 0;
+        if (!g_recycleTried[i])
+        {
+            g_recycleTried[i] = true;
+            SHSTOCKICONINFO sii{};
+            sii.cbSize = sizeof(sii);
+            if (SUCCEEDED(::SHGetStockIconInfo(full ? SIID_RECYCLERFULL : SIID_RECYCLER, SHGSI_ICON | SHGSI_SMALLICON, &sii)) && sii.hIcon)
+            {
+                g_recycle[i] = TextureFromIcon(sii.hIcon);
+                ::DestroyIcon(sii.hIcon);
+            }
+        }
+        return ToId(g_recycle[i]);
     }
 }

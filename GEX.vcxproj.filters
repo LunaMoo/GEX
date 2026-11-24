@@ -28,6 +28,9 @@
     <ClCompile Include="src\main.cpp">
       <Filter>Source</Filter>
     </ClCompile>
+    <ClCompile Include="src\MftReader.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
     <ClCompile Include="src\Scanner.cpp">
       <Filter>Source</Filter>
     </ClCompile>
@@ -76,6 +79,9 @@
       <Filter>Headers</Filter>
     </ClInclude>
     <ClInclude Include="src\Icons.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\MftReader.h">
       <Filter>Headers</Filter>
     </ClInclude>
     <ClInclude Include="src\Scanner.h">

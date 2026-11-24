@@ -27,6 +27,7 @@ Optional command line: `GEX.exe "D:\Some\Folder"` starts scanning that folder.
 - Multithreaded scanner (`FindFirstFileExW` with large fetch). Uses about 3 threads on spinning hard drives and more on SSD/NVMe (auto-detected, adjustable in *View*).
 - Counts hidden and system files, `pagefile.sys`, `hiberfil.sys` and so on. Junctions and symlinks are shown but not followed, so nothing is counted twice.
 - Progress bar shows real progress for drive scans (bytes found vs. used space). *Stop* keeps the partial result.
+- **Fast NTFS scan** (WizTree-style): when GEX runs as administrator it reads the NTFS master file table directly, so a whole drive takes seconds. It turns on automatically for NTFS drives and falls back to the normal scan otherwise (*View > Fast NTFS scan*). Hard-linked files are counted once in this mode, and NTFS metadata files (`$MFT`, `$LogFile`...) show up in the drive root.
 - Long path support (`\\?\`) and network shares (`\\server\share`).
 - *File > Restart as administrator* to include folders that need admin rights.
 
@@ -51,6 +52,8 @@ Optional command line: `GEX.exe "D:\Some\Folder"` starts scanning that folder.
 - *Show more options* or **Shift+F10** opens the real Windows context menu, including shell extensions like 7-Zip, Send to, antivirus scans and so on. Shift + right click shows the extended verbs. *View > Right click opens the Windows menu* makes it the default.
 - Copy, cut and paste use the Windows clipboard, so they work both ways with Explorer.
 - Drag files out of GEX (grab them by the name) into Explorer, the desktop or other apps.
+- **Drop files into GEX** from Explorer or anywhere else: onto a folder row, a folder in the tree, the treemap or the path bar, or onto empty space in the file list for the current folder. Like Explorer, it moves on the same drive and copies across drives; Shift forces a move and Ctrl forces a copy. Dropping a folder onto the drive bar or the start screen analyzes it.
+- **Recycle Bin**: the drive bar shows how much space the Recycle Bin uses (per drive in the tooltip). Click it to empty it, or right-click to open it or empty a single drive's bin. Also in *File > Empty Recycle Bin*.
 - Copying, moving, deleting and renaming go through `IFileOperation`, with the usual Windows progress, conflict and undo behavior. GEX always asks before deleting.
 
 ## Keyboard shortcuts
@@ -78,7 +81,6 @@ Optional command line: `GEX.exe "D:\Some\Folder"` starts scanning that folder.
 
 - Sizes are logical file sizes, as in Explorer's "Size" column, not "size on disk". Hard-linked files (e.g. in `C:\Windows\WinSxS`) are counted once per link, so that folder looks bigger than its real usage. OneDrive "online-only" files show their full size and are marked *Cloud* in the tooltip.
 - Settings, window layout and CSV exports are stored in `%APPDATA%\GEX`.
-- Not implemented yet: dropping files *into* GEX, and reading the NTFS MFT directly (a WizTree-style instant scan that needs admin rights).
 
 ## Project layout
 
@@ -86,7 +88,8 @@ Optional command line: `GEX.exe "D:\Some\Folder"` starts scanning that folder.
 GEX.sln / GEX.vcxproj     Visual Studio solution (x64 Debug/Release)
 src/main.cpp              Win32 window, D3D11, fonts, idle-friendly main loop
 src/App*.cpp, App.h       UI and application logic (AppUI = chrome/dialogs, AppViews = tabs)
-src/Scanner.*             multithreaded scanner
+src/Scanner.*             multithreaded scanner (+ MFT fast path)
+src/MftReader.*           NTFS master file table parser
 src/FileTree.*            in-memory tree (arena allocated) + live mutations
 src/Watcher.*             ReadDirectoryChangesW live monitor
 src/ShellOps.*            IFileOperation, IContextMenu, clipboard, drag & drop, properties

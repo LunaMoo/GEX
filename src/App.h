@@ -9,6 +9,7 @@
 #include "imgui.h"
 #include <deque>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -22,6 +23,7 @@ namespace gex
         bool  showHidden = true;          // hidden files are always counted; this only affects lists
         bool  showSystem = true;
         int   threads = 0;                // 0 = auto
+        bool  fastNtfs = true;            // read the NTFS MFT directly when running as administrator
         bool  nativeMenuByDefault = false;// right click shows the Windows menu directly
         bool  treemapInExplorer = true;
         float treemapSplit = 0.42f;       // fraction of explorer height used by the treemap
@@ -89,7 +91,7 @@ namespace gex
         uint64_t count = 0;
     };
 
-    class App
+    class App final : public shell::DropHandler
     {
     public:
         void Init(void* hwnd, const std::wstring& startPath);
@@ -100,6 +102,11 @@ namespace gex
         bool NeedsSlowRefresh() const;// live monitor running -> refresh a few times per second
         bool WantsQuit() const { return m_quit; }
         void SetUiScale(float s) { m_uiScale = s; }
+
+        // shell::DropHandler: files dragged onto the GEX window
+        uint32_t OnDragOver(const std::vector<std::wstring>& paths, int x, int y, uint32_t keys, uint32_t allowed) override;
+        void     OnDragLeave() override;
+        void     OnDrop(const std::vector<std::wstring>& paths, int x, int y, uint32_t keys, uint32_t effect) override;
 
     private:
         // ---- scanning
@@ -175,6 +182,22 @@ namespace gex
         void BeginBoxSelect(ListState& st, bool additive);
         void UpdateBoxSelect(ListState& st);
         bool PassesFilter(const Node* n) const;
+
+        // ---- drop targets (rebuilt every frame from what is visible)
+        enum DropKind { Drop_Folder, Drop_Analyze, Drop_Treemap };
+        struct DropZone { ImVec2 min, max; Node* dir; int kind; Treemap* tm; };
+        void AddDropZone(ImVec2 a, ImVec2 b, Node* dir, int kind, Treemap* tm = nullptr);
+        bool ResolveDrop(const std::vector<std::wstring>& paths, ImVec2 p, uint32_t keys, uint32_t allowed,
+                         uint32_t& effect, Node*& dir, int& kind, const DropZone*& zone);
+        void DrawDropOverlay();
+        void RunPendingDrops();
+
+        // ---- Recycle Bin
+        void RefreshRecycleBin();
+        void PollRecycleBin();
+        void RequestEmptyRecycleBin(const std::wstring& root);
+        void AfterRecycleBinChanged();
+        void DrawRecycleBinCard(ImVec2 size);
 
         // ---- live monitor
         void StartWatcher(const std::wstring& path);
@@ -277,8 +300,29 @@ namespace gex
         std::string  m_errorText;
         bool         m_openError = false;
 
+        // Drag & drop into GEX
+        std::vector<DropZone> m_dropZones, m_dropZonesBuild;
+        bool         m_extDrag = false;
+        ImVec2       m_dropPos = ImVec2(0, 0);
+        uint32_t     m_dropEffect = 0;
+        Node*        m_dropDir = nullptr;
+        int          m_dropKind = -1;
+        ImVec2       m_dropMin = ImVec2(0, 0), m_dropMax = ImVec2(0, 0);
+        size_t       m_dropCount = 0;
+        struct PendingDrop { std::vector<std::wstring> paths; std::wstring dest; bool move; bool analyze; };
+        std::vector<PendingDrop> m_pendingDrops;
+
+        // Recycle Bin
+        std::future<shell::RecycleBinInfo> m_rbFuture;
+        shell::RecycleBinInfo m_rb;
+        bool         m_rbKnown = false;
+        double       m_rbQueriedAt = -100.0;
+        bool         m_rbRefreshSoon = false;
+        std::wstring m_rbEmptyRoot;          // "" = all drives
+        bool         m_openEmptyRb = false;
+
         // Deferred blocking actions, executed in PostFrame()
-        enum class Deferred { None, NativeMenu, NativeBgMenu, DragOut, PickFolder, PickWatchFolder, Properties };
+        enum class Deferred { None, NativeMenu, NativeBgMenu, DragOut, PickFolder, PickWatchFolder, Properties, EmptyRecycleBin };
         Deferred     m_deferred = Deferred::None;
         std::vector<std::wstring> m_deferredPaths;
         std::wstring m_deferredDir;

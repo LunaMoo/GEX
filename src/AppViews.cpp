@@ -258,6 +258,7 @@ namespace gex
                     }
                     ImGui::Selectable("##row", sel, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick);
                     const bool hovered = ImGui::IsItemHovered();
+                    if (n->IsDir()) AddDropZone(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), n, Drop_Folder);
                     if (!n->IsRemoved())
                     {
                         if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
@@ -353,6 +354,8 @@ namespace gex
             ImGui::IsMouseReleased(ImGuiMouseButton_Right) && mode == List_Explorer)
         { ClearSelection(); OpenBackgroundMenu(m_cur, io.KeyShift); }
         HandleListShortcuts(st, mode);
+        if (mode == List_Explorer && m_cur)   // dropping on empty space or a file row = into the current folder
+            AddDropZone(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(), ImGui::GetWindowPos().y + ImGui::GetWindowHeight()), m_cur, Drop_Folder);
         ImGui::EndChild();
         ImGui::PopID();
     }
@@ -482,6 +485,7 @@ namespace gex
             ImGui::SetNextItemOpen(open, ImGuiCond_Always);
             rowStartX = ImGui::GetCursorScreenPos().x;
             const bool nowOpen = ImGui::TreeNodeEx((void*)n, flags, "%s", "");
+            AddDropZone(ImVec2(ImGui::GetWindowPos().x, ImGui::GetItemRectMin().y), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(), ImGui::GetItemRectMax().y), n, Drop_Folder);
             if (ImGui::IsItemToggledOpen()) { if (nowOpen) m_treeOpen.insert(n); else m_treeOpen.erase(n); }
             clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen();
             hovered = ImGui::IsItemHovered();
@@ -502,6 +506,7 @@ namespace gex
             const ImVec2 boxMin(cx(depth) - half, midY - half), boxMax(cx(depth) + half + 1, midY + half + 1);
 
             ImGui::Selectable("##tn", n == m_cur, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap | ImGuiSelectableFlags_AllowDoubleClick, ImVec2(0, fs));
+            AddDropZone(ImVec2(ImGui::GetWindowPos().x, rowTop), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(), rowBot), n, Drop_Folder);
             hovered = ImGui::IsItemHovered();
             const ImVec2 m = ImGui::GetIO().MousePos;
             const bool onBox = hasKids && m.x >= boxMin.x - 3 && m.x <= boxMax.x + 3 && m.y >= rowTop && m.y <= rowBot;
@@ -750,6 +755,7 @@ namespace gex
     {
         ImGuiIO& io = ImGui::GetIO();
         const Treemap::Result r = tm.Draw(id, m_tree.get(), root, size, m_sel);
+        AddDropZone(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), root, Drop_Treemap, &tm);
         if (r.hovered) m_tmHover = r.hovered;
         if (r.hovered && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId) && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
             DrawNodeTooltip(r.hovered, root ? root->size : 0);

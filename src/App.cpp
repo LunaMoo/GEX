@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <cfloat>
+#include <cwctype>
 
 namespace gex
 {
@@ -27,14 +29,17 @@ namespace gex
         m_tmMain.showLabels = m_tmExplorer.showLabels = m_set.treemapLabels;
         m_tmMain.cushion = m_tmExplorer.cushion = m_set.treemapCushion;
         snprintf(m_liveExcludeBuf, sizeof(m_liveExcludeBuf), "%s", m_set.liveExclude.c_str());
+        shell::RegisterDropTarget(this);
         if (!startPath.empty()) StartScan(startPath);
     }
 
     void App::Shutdown()
     {
+        shell::RevokeDropTarget();
         m_set.liveExclude = m_liveExcludeBuf;
         SaveSettings();
         m_watcher.Stop();
+        if (m_rbFuture.valid()) m_rbFuture.wait();
         m_scanner.Cancel();
         m_subScanner.Cancel();
         m_scanner.Wait();
@@ -43,7 +48,7 @@ namespace gex
 
     bool App::NeedsFastRefresh() const
     {
-        return m_scanner.IsRunning() || m_subScanner.IsRunning() || !m_subQueue.empty() || m_deferred != Deferred::None || m_boxSelecting;
+        return m_scanner.IsRunning() || m_subScanner.IsRunning() || !m_subQueue.empty() || m_deferred != Deferred::None || m_boxSelecting || m_extDrag || !m_pendingDrops.empty();
     }
 
     bool App::NeedsSlowRefresh() const
@@ -78,6 +83,7 @@ namespace gex
             else if (key == "recentWindow") m_set.recentWindow = atoi(val.c_str());
             else if (key == "lastPath") m_set.lastPath = ToWide(val);
             else if (key == "liveExclude") m_set.liveExclude = val;
+            else if (key == "fastNtfs") b(m_set.fastNtfs);
             else if (key == "treeStyle") m_set.treeStyle = atoi(val.c_str()) == 1 ? 1 : 0;
             else if (key == "treeSizesLeft") b(m_set.treeSizesFirst);
             else if (key.rfind("cat", 0) == 0 || key == "folderColor")
@@ -103,7 +109,7 @@ namespace gex
         fprintf(f, "treemapLabels=%d\ntreemapCushion=%d\nliveUpdateTree=%d\nliveFilesOnly=%d\nrecentWindow=%d\n",
             m_set.treemapLabels, m_set.treemapCushion, m_set.liveUpdateTree, m_set.liveFilesOnly, m_set.recentWindow);
         fprintf(f, "lastPath=%s\nliveExclude=%s\n", ToUtf8(m_set.lastPath).c_str(), m_set.liveExclude.c_str());
-        fprintf(f, "treeStyle=%d\ntreeSizesLeft=%d\n", m_set.treeStyle, m_set.treeSizesFirst);
+        fprintf(f, "treeStyle=%d\ntreeSizesLeft=%d\nfastNtfs=%d\n", m_set.treeStyle, m_set.treeSizesFirst, m_set.fastNtfs);
         for (int i = 0; i < Cat_COUNT; ++i)
         {
             const float* c = GetCategoryInfo(i).color;
@@ -121,7 +127,7 @@ namespace gex
         m_scanner.Cancel();
         m_scanner.Wait();
         m_scanner.TakeResult();
-        if (!m_scanner.Start(path, m_set.threads))
+        if (!m_scanner.Start(path, m_set.threads, m_set.fastNtfs))
         {
             m_errorText = "Cannot open \"" + ToUtf8(path) + "\".\nThe folder does not exist or access was denied.";
             m_openError = true;
@@ -690,7 +696,13 @@ namespace gex
         case Deferred::Properties:
             shell::ShowProperties(m_deferredPaths);
             break;
+        case Deferred::EmptyRecycleBin:
+            shell::EmptyRecycleBin(m_deferredDir);
+            io.AddMouseButtonEvent(0, false);
+            AfterRecycleBinChanged();
+            break;
         }
+        RunPendingDrops();
     }
 
     // ===================================================================== frame
@@ -698,10 +710,12 @@ namespace gex
     {
         icons::NewFrame();
         m_tmHover = nullptr;   // set again by the treemap while hovered
+        m_dropZonesBuild.clear();
         PollScanner();
         PollSubScans();
         PollScheduledRefresh();
         PollWatcher();
+        PollRecycleBin();
         PruneSelection();
         if (ImGui::GetTime() - m_drivesRefreshed > 10.0)
         {
@@ -746,7 +760,9 @@ namespace gex
         DrawStatusBar();
         HandleGlobalShortcuts();
         DrawPopups();
+        DrawDropOverlay();
         ImGui::End();
+        m_dropZones.swap(m_dropZonesBuild);   // used by OLE drag callbacks until the next frame
     }
 
     // ===================================================================== shortcuts
@@ -845,5 +861,198 @@ namespace gex
             if (!paths.empty()) OpenItemMenu(paths, io.KeyShift);
             else if (mode == List_Explorer) OpenBackgroundMenu(m_cur, io.KeyShift);
         }
+    }
+}
+
+namespace gex
+{
+    // ===================================================================== Recycle Bin
+    void App::RefreshRecycleBin()
+    {
+        if (m_rbFuture.valid()) { m_rbRefreshSoon = true; return; }   // one query at a time
+        std::vector<std::wstring> roots;
+        for (auto& d : m_drives)
+            if (d.ready && (d.type == 3 /*DRIVE_FIXED*/ || d.type == 2 /*DRIVE_REMOVABLE*/)) roots.push_back(d.root);
+        m_rbQueriedAt = ImGui::GetTime();
+        // SHQueryRecycleBin walks the bins; do it off the UI thread
+        m_rbFuture = std::async(std::launch::async, [roots]() { return shell::QueryRecycleBin(roots); });
+    }
+
+    void App::PollRecycleBin()
+    {
+        if (m_rbFuture.valid() && m_rbFuture.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+        {
+            m_rb = m_rbFuture.get();
+            m_rbKnown = true;
+        }
+        const double now = ImGui::GetTime();
+        if (!m_rbFuture.valid() && (m_rbRefreshSoon || now - m_rbQueriedAt > 15.0) && !m_drives.empty())
+        {
+            m_rbRefreshSoon = false;
+            RefreshRecycleBin();
+        }
+    }
+
+    void App::RequestEmptyRecycleBin(const std::wstring& root)
+    {
+        m_rbEmptyRoot = root;
+        m_openEmptyRb = true;
+        m_rbRefreshSoon = true;   // show up-to-date numbers in the dialog
+    }
+
+    void App::AfterRecycleBinChanged()
+    {
+        m_rbRefreshSoon = true;
+        m_drivesRefreshed = -100.0;   // free space changed
+        // keep the scan results honest: the hidden $Recycle.Bin folders hold the deleted files
+        if (m_tree)
+            for (auto& d : m_drives)
+            {
+                const std::wstring bin = JoinPath(d.root, L"$Recycle.Bin");
+                if (m_tree->Find(bin)) QueueSubtreeScan(bin);
+            }
+    }
+}
+
+namespace gex
+{
+    // ===================================================================== drag & drop into GEX
+    void App::AddDropZone(ImVec2 a, ImVec2 b, Node* dir, int kind, Treemap* tm)
+    {
+        // only the part visible in the current (scrolling) window counts
+        const ImVec2 cmin = ImGui::GetWindowPos();
+        const ImVec2 cmax(cmin.x + ImGui::GetWindowWidth(), cmin.y + ImGui::GetWindowHeight());
+        a.x = std::max(a.x, cmin.x); a.y = std::max(a.y, cmin.y);
+        b.x = std::min(b.x, cmax.x); b.y = std::min(b.y, cmax.y);
+        if (b.x <= a.x || b.y <= a.y) return;
+        if (kind != Drop_Analyze && (!dir || dir->IsRemoved() || !dir->IsDir() || (dir->flags & NF_Reparse))) return;
+        m_dropZonesBuild.push_back({ a, b, dir, kind, tm });
+    }
+
+    bool App::ResolveDrop(const std::vector<std::wstring>& paths, ImVec2 p, uint32_t keys, uint32_t allowed,
+                          uint32_t& effect, Node*& dir, int& kind, const DropZone*& zone)
+    {
+        effect = shell::kDropNone; dir = nullptr; kind = -1; zone = nullptr;
+        // the smallest zone under the cursor wins (a folder row beats the list background)
+        float best = 3.4e38f;
+        for (const DropZone& z : m_dropZones)
+            if (p.x >= z.min.x && p.x < z.max.x && p.y >= z.min.y && p.y < z.max.y)
+            {
+                const float area = (z.max.x - z.min.x) * (z.max.y - z.min.y);
+                if (area < best) { best = area; zone = &z; }
+            }
+        if (!zone) return false;
+        kind = zone->kind;
+        if (kind == Drop_Analyze)
+        {
+            effect = (allowed & shell::kDropCopy) ? shell::kDropCopy : (allowed & shell::kDropLink);
+            return effect != 0;
+        }
+        dir = zone->dir;
+        if (kind == Drop_Treemap && zone->tm)
+            if (Node* n = zone->tm->HitTest(p))
+                dir = n->IsDir() && !(n->flags & NF_Reparse) ? n : n->parent;
+        if (!m_tree || !dir || dir->IsRemoved()) return false;
+
+        const std::wstring dest = m_tree->FullPath(dir);
+        bool allHere = true;
+        for (const auto& s : paths)
+        {
+            if (PathEquals(s, dest) || PathStartsWith(dest, s)) return false;   // a folder into itself
+            if (!PathEquals(ParentPath(s), dest)) allHere = false;
+        }
+        // Explorer rules: same drive = move, other drive = copy; Shift forces move, Ctrl forces copy.
+        bool move;
+        if (keys & shell::kKeyCtrl) move = false;
+        else if (keys & shell::kKeyShift) move = true;
+        else
+        {
+            const std::wstring& s = paths[0];
+            move = s.size() > 1 && dest.size() > 1 && s[1] == L':' && dest[1] == L':' && towupper(s[0]) == towupper(dest[0]);
+        }
+        if (allHere && move) return false;   // already there
+        effect = move ? shell::kDropMove : shell::kDropCopy;
+        if (!(effect & allowed)) effect = (allowed & shell::kDropCopy) ? shell::kDropCopy : shell::kDropNone;
+        return effect != shell::kDropNone;
+    }
+
+    uint32_t App::OnDragOver(const std::vector<std::wstring>& paths, int x, int y, uint32_t keys, uint32_t allowed)
+    {
+        // OLE owns the mouse during a drag: feed its position to Dear ImGui so rows highlight under the cursor
+        m_dropPos = ImVec2((float)x, (float)y);
+        ImGui::GetIO().AddMousePosEvent(m_dropPos.x, m_dropPos.y);
+        m_extDrag = true;
+        m_dropCount = paths.size();
+        const DropZone* zone = nullptr;
+        ResolveDrop(paths, m_dropPos, keys, allowed, m_dropEffect, m_dropDir, m_dropKind, zone);
+        if (zone) { m_dropMin = zone->min; m_dropMax = zone->max; }
+        return m_dropEffect;
+    }
+
+    void App::OnDragLeave()
+    {
+        m_extDrag = false;
+        m_dropEffect = 0;
+        m_dropDir = nullptr;
+        ImGui::GetIO().AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+    }
+
+    void App::OnDrop(const std::vector<std::wstring>& paths, int x, int y, uint32_t keys, uint32_t allowed)
+    {
+        m_extDrag = false;
+        uint32_t effect; Node* dir; int kind; const DropZone* zone;
+        if (!ResolveDrop(paths, ImVec2((float)x, (float)y), keys, allowed, effect, dir, kind, zone)) return;
+        PendingDrop d;
+        d.paths = paths;
+        d.analyze = kind == Drop_Analyze;
+        d.move = effect == shell::kDropMove;
+        if (d.analyze)
+        {
+            shell::Stat st;
+            d.dest = (shell::GetStat(paths[0], st) && st.isDir) ? paths[0] : ParentPath(paths[0]);
+        }
+        else d.dest = m_tree->FullPath(dir);
+        // the file operation runs after the drop returns (it shows its own progress UI)
+        m_pendingDrops.push_back(std::move(d));
+    }
+
+    void App::RunPendingDrops()
+    {
+        std::vector<PendingDrop> drops;
+        drops.swap(m_pendingDrops);
+        for (auto& d : drops)
+        {
+            if (d.analyze) { StartScan(d.dest); continue; }
+            if (shell::CopyOrMoveItems(d.paths, d.dest, d.move))
+            {
+                if (d.move) AfterExternalChange(d.paths);
+                if (m_tree)
+                    if (Node* n = m_tree->Find(d.dest)) ShallowRefresh(n);
+                ScheduleRefresh(d.dest, 1.5);
+            }
+        }
+    }
+
+    void App::DrawDropOverlay()
+    {
+        if (!m_extDrag) return;
+        ImDrawList* dl = ImGui::GetForegroundDrawList();
+        const bool ok = m_dropEffect != 0;
+        const ImU32 col = ok ? IM_COL32(61, 220, 151, 255) : IM_COL32(255, 92, 92, 200);
+        if (m_dropKind >= 0) dl->AddRect(m_dropMin, m_dropMax, col, 4.0f, 0, 2.0f);
+        std::string label;
+        if (!ok) label = "Can't drop here";
+        else if (m_dropKind == Drop_Analyze) label = "Analyze dropped folder";
+        else
+        {
+            label = std::string(m_dropEffect == shell::kDropMove ? "Move " : "Copy ") + std::to_string(m_dropCount) +
+                    (m_dropCount == 1 ? " item to " : " items to ") + (m_dropDir ? m_dropDir->name : std::string());
+            label += m_dropEffect == shell::kDropMove ? "   (Ctrl = copy)" : "   (Shift = move)";
+        }
+        const ImVec2 ts = ImGui::CalcTextSize(label.c_str());
+        const ImVec2 p(m_dropPos.x + 22 * m_uiScale, m_dropPos.y + 26 * m_uiScale);
+        dl->AddRectFilled(ImVec2(p.x - 6, p.y - 4), ImVec2(p.x + ts.x + 6, p.y + ts.y + 4), IM_COL32(28, 32, 48, 235), 5.0f);
+        dl->AddRect(ImVec2(p.x - 6, p.y - 4), ImVec2(p.x + ts.x + 6, p.y + ts.y + 4), col, 5.0f);
+        dl->AddText(p, IM_COL32(235, 238, 245, 255), label.c_str());
     }
 }

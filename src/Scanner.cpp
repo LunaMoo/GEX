@@ -1,6 +1,7 @@
 // GEX - Graphical Explorer
 #include "Scanner.h"
 #include "Util.h"
+#include "MftReader.h"
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -54,7 +55,7 @@ namespace gex
         return std::clamp(hw * 2, 4, 24);                  // SSD/NVMe: metadata is cached, more parallelism helps
     }
 
-    bool Scanner::Start(const std::wstring& rootPath, int threads)
+    bool Scanner::Start(const std::wstring& rootPath, int threads, bool allowMft)
     {
         if (m_running) return false;
         Join();
@@ -66,6 +67,7 @@ namespace gex
         m_result.reset();
         m_threadCount = threads > 0 ? threads : SuggestThreads(m_root);
         m_cancel = false; m_done = false; m_finalizing = false;
+        m_allowMft = allowMft; m_mftActive = false; m_mftFraction = 0.0f;
         m_files = 0; m_dirs = 0; m_bytes = 0; m_errors = 0;
         m_queue.clear();
         m_queue.push_back(m_tree->root);
@@ -99,6 +101,8 @@ namespace gex
         p.seconds = (double)(end - m_startTicks) / 1000.0;
         p.threads = m_threadCount;
         p.finalizing = m_finalizing;
+        p.mft = m_mftActive;
+        p.fraction = m_mftActive ? m_mftFraction.load() : -1.0f;
         std::lock_guard<std::mutex> lk(m_curMutex);
         p.current = m_current;
         return p;
@@ -107,6 +111,30 @@ namespace gex
     void Scanner::Coordinator()
     {
         ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        if (m_allowMft && ScanMft())
+        {
+            m_finalizing = true;
+            m_tree->scanErrors = 0;
+            m_tree->partial = false;
+            m_tree->usedMft = true;
+            m_tree->Finalize();
+            m_endTicks = Ticks();
+            m_tree->scanSeconds = (double)(m_endTicks - m_startTicks) / 1000.0;
+            m_tree->scanTime = NowFileTime();
+            m_result = std::move(m_tree);
+            m_done = true;
+            m_running = false;
+            return;
+        }
+        if (m_cancel)
+        {
+            // stopped while reading the MFT: there is nothing useful to show, keep the previous results
+            m_endTicks = Ticks();
+            m_result.reset();
+            m_done = true;
+            m_running = false;
+            return;
+        }
         std::vector<std::thread> workers;
         std::vector<NodeArena*> arenas;
         for (int i = 0; i < m_threadCount; ++i) arenas.push_back(m_tree->NewArena());
@@ -218,5 +246,87 @@ namespace gex
         m_files += localFiles;
         m_dirs += localDirs;
         m_bytes += localBytes;
+    }
+}
+
+namespace gex
+{
+    // ---------------------------------------------------------------- NTFS MFT fast path
+    bool Scanner::ScanMft()
+    {
+        // local drive letter paths only
+        if (m_root.size() < 3 || m_root[1] != L':' || m_root[2] != L'\\') return false;
+        if (!IsProcessElevated()) return false;
+        const std::wstring driveRoot = m_root.substr(0, 3);
+        wchar_t fsName[MAX_PATH + 1] = {};
+        if (!::GetVolumeInformationW(driveRoot.c_str(), nullptr, 0, nullptr, nullptr, nullptr, fsName, MAX_PATH) || _wcsicmp(fsName, L"NTFS") != 0)
+            return false;
+        const std::wstring volPath = std::wstring(L"\\\\.\\") + m_root[0] + L":";
+        HANDLE vol = ::CreateFileW(volPath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                   OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (vol == INVALID_HANDLE_VALUE) return false;
+
+        NTFS_VOLUME_DATA_BUFFER nv{};
+        DWORD got = 0;
+        if (!::DeviceIoControl(vol, FSCTL_GET_NTFS_VOLUME_DATA, nullptr, 0, &nv, sizeof(nv), &got, nullptr))
+        {
+            ::CloseHandle(vol);
+            return false;
+        }
+        mft::VolumeInfo vi;
+        vi.bytesPerSector = nv.BytesPerSector;
+        vi.bytesPerCluster = nv.BytesPerCluster;
+        vi.recordSize = nv.BytesPerFileRecordSegment;
+        vi.mftStartLcn = (uint64_t)nv.MftStartLcn.QuadPart;
+        vi.mftValidLength = (uint64_t)nv.MftValidDataLength.QuadPart;
+
+        {
+            std::lock_guard<std::mutex> lk(m_curMutex);
+            m_current = L"Reading the NTFS master file table of " + driveRoot + L" ...";
+        }
+        m_mftActive = true;
+
+        // Raw volume reads: page-aligned bounce buffer, sector-aligned offsets (the reader asks for whole clusters).
+        const size_t bounceSize = 16u << 20;
+        uint8_t* bounce = (uint8_t*)::VirtualAlloc(nullptr, bounceSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        mft::ReadFn read = [&](uint64_t offset, void* dst, uint32_t size) -> bool
+        {
+            uint8_t* out = (uint8_t*)dst;
+            while (size > 0)
+            {
+                const DWORD n = (DWORD)std::min<size_t>(size, bounceSize);
+                LARGE_INTEGER li; li.QuadPart = (LONGLONG)offset;
+                DWORD rd = 0;
+                if (!::SetFilePointerEx(vol, li, nullptr, FILE_BEGIN) || !::ReadFile(vol, bounce, n, &rd, nullptr) || rd != n) return false;
+                memcpy(out, bounce, n);
+                out += n; offset += n; size -= n;
+            }
+            return true;
+        };
+
+        // Build the whole volume; if a sub folder was requested, re-root the tree there afterwards.
+        std::unique_ptr<FileTree> vt(new FileTree(driveRoot));
+        mft::Counters c{ &m_files, &m_dirs, &m_bytes, &m_mftFraction, &m_cancel };
+        std::string err;
+        const bool ok = bounce && mft::BuildTree(vi, read, *vt, c, err);
+        if (bounce) ::VirtualFree(bounce, 0, MEM_RELEASE);
+        ::CloseHandle(vol);
+        m_mftActive = false;
+        if (!ok)
+        {
+            m_files = 0; m_dirs = 0; m_bytes = 0;
+            return false;
+        }
+        if (!PathEquals(m_root, driveRoot))
+        {
+            Node* sub = vt->Find(m_root);
+            if (!sub || !sub->IsDir()) return false;
+            sub->parent = nullptr;
+            sub->name = ToUtf8(m_root);
+            vt->root = sub;
+            vt->rootPath = m_root;
+        }
+        m_tree = std::move(vt);
+        return true;
     }
 }

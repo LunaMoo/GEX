@@ -67,6 +67,7 @@ namespace gex
         double              scanSeconds = 0.0;
         uint64_t            scanTime = 0;         // FILETIME when scan finished
         bool                partial = false;      // scan was cancelled
+        bool                usedMft = false;      // built from the NTFS master file table
 
         NodeArena* NewArena();                    // for scanner threads
         NodeArena* MainArena();                   // for UI thread insertions

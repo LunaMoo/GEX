@@ -54,6 +54,34 @@ namespace gex::shell
     // Blocks until the drop finishes. Returns the DROPEFFECT (0 = none/cancelled).
     uint32_t DragOut(const std::vector<std::wstring>& paths);
 
+    // --- Recycle Bin ---
+    struct RecycleBinInfo
+    {
+        uint64_t size = 0, count = 0;                                   // all drives together
+        std::vector<std::pair<std::wstring, uint64_t>> driveSize;      // per drive root ("C:\") -> bytes
+        std::vector<std::pair<std::wstring, uint64_t>> driveCount;
+    };
+    // Safe to call from a worker thread (initializes COM itself). Pass the drive roots to query.
+    RecycleBinInfo QueryRecycleBin(const std::vector<std::wstring>& driveRoots);
+    // Permanently deletes the Recycle Bin contents (one drive, or all when root is empty). Shows Windows' progress UI.
+    bool EmptyRecycleBin(const std::wstring& root);
+    bool OpenRecycleBin();
+
+    // --- drag & drop into GEX ---
+    enum : uint32_t { kDropNone = 0, kDropCopy = 1, kDropMove = 2, kDropLink = 4 };   // DROPEFFECT_*
+    enum : uint32_t { kKeyShift = 0x4, kKeyCtrl = 0x8, kKeyAlt = 0x20 };              // MK_*
+    class DropHandler
+    {
+    public:
+        virtual ~DropHandler() = default;
+        // Client-area pixel coordinates. Return the effect to show (kDropNone refuses the drop).
+        virtual uint32_t OnDragOver(const std::vector<std::wstring>& paths, int x, int y, uint32_t keys, uint32_t allowed) = 0;
+        virtual void     OnDragLeave() = 0;
+        virtual void     OnDrop(const std::vector<std::wstring>& paths, int x, int y, uint32_t keys, uint32_t effect) = 0;
+    };
+    bool RegisterDropTarget(DropHandler* handler);   // call after Init(); needs OleInitialize
+    void RevokeDropTarget();
+
     // --- misc ---
     bool PickFolder(std::wstring& out);
     bool RelaunchAsAdmin(const std::wstring& args);

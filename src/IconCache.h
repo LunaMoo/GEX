@@ -15,4 +15,5 @@ namespace gex::icons
     bool        NeedsFullPath(const std::string& nameUtf8);   // exe/lnk/ico have per-file icons
     ImTextureID ForFolder();
     ImTextureID ForDrive(const std::wstring& root);
+    ImTextureID ForRecycleBin(bool full);
 }

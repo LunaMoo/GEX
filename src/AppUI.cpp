@@ -115,6 +115,13 @@ namespace gex
             if (ImGui::MenuItem(IL(ICON_REFRESH, "Rescan everything").c_str(), "Ctrl+F5", false, m_tree != nullptr)) StartScan(m_tree->rootPath);
             if (ImGui::MenuItem(IL(ICON_STOP, "Stop scan").c_str(), nullptr, false, m_scanner.IsRunning())) m_scanner.Cancel();
             ImGui::Separator();
+            {
+                std::string label = IL(ICON_DELETE, "Empty Recycle Bin...");
+                if (m_rbKnown) label += m_rb.count ? "  (" + FormatSize(m_rb.size) + ")" : "  (empty)";
+                if (ImGui::MenuItem(label.c_str(), nullptr, false, !m_rbKnown || m_rb.count > 0)) RequestEmptyRecycleBin(L"");
+            }
+            if (ImGui::MenuItem("Open Recycle Bin")) shell::OpenRecycleBin();
+            ImGui::Separator();
             if (ImGui::MenuItem(IL(ICON_SHIELD, "Restart as administrator").c_str(), nullptr, false, !m_elevated))
             {
                 std::wstring args = m_tree ? L"\"" + m_tree->rootPath + (m_tree->rootPath.back() == L'\\' ? L"\\" : L"") + L"\"" : L"";
@@ -152,6 +159,10 @@ namespace gex
             ImGui::Separator();
             dirty |= ImGui::MenuItem("Right click opens the Windows menu", nullptr, &m_set.nativeMenuByDefault);
             ImGui::Separator();
+            dirty |= ImGui::MenuItem("Fast NTFS scan (read the MFT)", nullptr, &m_set.fastNtfs);
+            ImGui::SetItemTooltip("Reads the NTFS master file table directly, like WizTree: a whole drive in seconds.\n"
+                                  "Needs administrator rights (File > Restart as administrator); otherwise the normal scan is used.\n"
+                                  "Hard-linked files are counted once.");
             ImGui::SetNextItemWidth(160 * m_uiScale);
             if (ImGui::SliderInt("Scan threads", &m_set.threads, 0, 32, m_set.threads == 0 ? "Auto" : "%d")) dirty = true;
             ImGui::SetItemTooltip("Auto uses ~3 threads on spinning hard drives and more on SSD/NVMe.");
@@ -247,6 +258,7 @@ namespace gex
                     const bool last = i + 1 == chain.size();
                     if (last) ImGui::PushStyleColor(ImGuiCol_Text, Hex(0x9FD8FF));
                     if (ImGui::Button(chain[i]->name.c_str())) Navigate(chain[i]);
+                    AddDropZone(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), chain[i], Drop_Folder);
                     if (last) ImGui::PopStyleColor();
                     if (ImGui::IsItemHovered() && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
                         OpenItemMenu({ m_tree->FullPath(chain[i]) }, shell::IsShiftDown());
@@ -344,7 +356,71 @@ namespace gex
         ImGui::SameLine();
         if (ImGui::Button(IL(ICON_FOLDER_OPEN, "Folder...").c_str(), ImVec2(0, card.y))) m_deferred = Deferred::PickFolder;
         ImGui::SetItemTooltip("Analyze any folder (also network shares)");
+        ImGui::SameLine();
+        DrawRecycleBinCard(ImVec2(170.0f * m_uiScale, card.y));
+        // drop a folder onto the drive bar to analyze it
+        AddDropZone(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(), ImGui::GetWindowPos().y + ImGui::GetWindowHeight()), nullptr, Drop_Analyze);
         ImGui::EndChild();
+    }
+
+    void App::DrawRecycleBinCard(ImVec2 size)
+    {
+        const bool full = m_rbKnown && m_rb.count > 0;
+        const bool clicked = ImGui::InvisibleButton("##recyclebin", size);
+        const bool hovered = ImGui::IsItemHovered();
+        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float s = m_uiScale, fs = ImGui::GetFontSize(), pad = 6.0f * s;
+        dl->AddRectFilled(a, b, hovered ? IM_COL32(70, 44, 52, 255) : IM_COL32(32, 36, 54, 255), 6.0f * s);
+        if (full) dl->AddRect(a, b, hovered ? IM_COL32(255, 120, 120, 255) : IM_COL32(150, 80, 90, 255), 6.0f * s);
+        float x = a.x + pad;
+        if (ImTextureID ic = icons::ForRecycleBin(full))
+        {
+            dl->AddImage(ic, ImVec2(x, a.y + pad), ImVec2(x + fs, a.y + pad + fs));
+            x += fs + 4 * s;
+        }
+        const ImVec4 clip(a.x, a.y, b.x - pad, b.y);
+        dl->AddText(ImGui::GetFont(), fs, ImVec2(x, a.y + pad), IM_COL32(230, 233, 242, 255), "Recycle Bin", nullptr, 0, &clip);
+        std::string info = !m_rbKnown ? "checking..." : full ? FormatSize(m_rb.size) + " in " + FormatCount(m_rb.count) + (m_rb.count == 1 ? " item" : " items") : "Empty";
+        dl->AddText(ImGui::GetFont(), fs * 0.92f, ImVec2(a.x + pad, a.y + pad + fs + 3 * s), full ? IM_COL32(255, 160, 140, 255) : IM_COL32(150, 158, 180, 255), info.c_str(), nullptr, 0, &clip);
+        if (full)
+        {
+            const char* hint = "click to empty";
+            dl->AddText(ImGui::GetFont(), fs * 0.85f, ImVec2(a.x + pad, b.y - pad - fs * 0.85f), IM_COL32(125, 132, 153, 255), hint, nullptr, 0, &clip);
+        }
+        if (hovered)
+        {
+            ImGui::BeginTooltip();
+            ImGui::TextUnformatted("Recycle Bin");
+            if (full)
+            {
+                ImGui::Separator();
+                for (size_t i = 0; i < m_rb.driveSize.size(); ++i)
+                    ImGui::Text("%s  %s  (%s items)", ToUtf8(m_rb.driveSize[i].first).c_str(), FormatSize(m_rb.driveSize[i].second).c_str(),
+                                FormatCount(m_rb.driveCount[i].second).c_str());
+                ImGui::Separator();
+                ImGui::TextDisabled("Click: empty   Right click: more options");
+            }
+            else ImGui::TextDisabled(m_rbKnown ? "Empty. Right click: open it" : "Checking...");
+            ImGui::EndTooltip();
+        }
+        if (clicked && full) RequestEmptyRecycleBin(L"");
+        if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right)) ImGui::OpenPopup("##rbmenu");
+        if (ImGui::BeginPopup("##rbmenu"))
+        {
+            if (ImGui::MenuItem("Open Recycle Bin")) shell::OpenRecycleBin();
+            if (ImGui::MenuItem("Refresh")) m_rbRefreshSoon = true;
+            ImGui::Separator();
+            ImGui::PushStyleColor(ImGuiCol_Text, Hex(0xFF8A8A));
+            if (ImGui::MenuItem("Empty Recycle Bin (all drives)", nullptr, false, full)) RequestEmptyRecycleBin(L"");
+            for (size_t i = 0; i < m_rb.driveSize.size(); ++i)
+            {
+                const std::string l = "Empty only " + ToUtf8(m_rb.driveSize[i].first) + "  (" + FormatSize(m_rb.driveSize[i].second) + ")";
+                if (ImGui::MenuItem(l.c_str())) RequestEmptyRecycleBin(m_rb.driveSize[i].first);
+            }
+            ImGui::PopStyleColor();
+            ImGui::EndPopup();
+        }
     }
 
     void App::DrawScanProgress()
@@ -354,10 +430,14 @@ namespace gex
         for (auto& d : m_drives)
             if (PathEquals(d.root, m_scanner.Root()) && d.ready && d.total > d.free)
                 fraction = std::min(0.99f, (float)((double)p.bytes / (double)(d.total - d.free)));
+        if (p.fraction >= 0.0f) fraction = p.fraction;
         char overlay[256];
-        snprintf(overlay, sizeof(overlay), "%s  %s files  %s folders  %s  %.1fs  (%d threads)",
-            p.finalizing ? "Sorting..." : "Scanning", FormatCount(p.files).c_str(), FormatCount(p.dirs).c_str(),
-            FormatSize(p.bytes).c_str(), p.seconds, p.threads);
+        if (p.mft)
+            snprintf(overlay, sizeof(overlay), "Fast NTFS scan: reading the master file table... %.0f%%  %.1fs", p.fraction * 100.0f, p.seconds);
+        else
+            snprintf(overlay, sizeof(overlay), "%s  %s files  %s folders  %s  %.1fs  (%d threads)",
+                p.finalizing ? "Sorting..." : "Scanning", FormatCount(p.files).c_str(), FormatCount(p.dirs).c_str(),
+                FormatSize(p.bytes).c_str(), p.seconds, p.threads);
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, Hex(0xB06BFF));
         ImGui::ProgressBar(fraction, ImVec2(ImGui::GetContentRegionAvail().x - 90 * m_uiScale, 0), overlay);
         ImGui::PopStyleColor();
@@ -365,6 +445,11 @@ namespace gex
         if (ImGui::Button(IL(ICON_STOP, "Stop").c_str(), ImVec2(-FLT_MIN, 0))) m_scanner.Cancel();
         ImGui::SetItemTooltip("Stop scanning and show what was found so far");
         ImGui::TextDisabled("%s", ToUtf8(p.current).c_str());
+        if (!m_elevated && m_set.fastNtfs && !p.mft)
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(Hex(0xFFC857), "  Tip: run as administrator for the fast NTFS scan (File > Restart as administrator).");
+        }
     }
 
     // ===================================================================== welcome
@@ -406,10 +491,12 @@ namespace gex
         ImGui::SetCursorPosX((avail.x - ImGui::CalcTextSize(btn).x - 40 * s) * 0.5f);
         if (ImGui::Button(IL(ICON_FOLDER_OPEN, btn).c_str())) m_deferred = Deferred::PickFolder;
         ImGui::Dummy(ImVec2(0, 10 * s));
+        centered("You can also drop a folder anywhere here to analyze it.", Hex(0x7D8499));
         if (!m_elevated)
         {
-            centered("Tip: some system folders can only be measured when GEX runs as administrator (File > Restart as administrator).", Hex(0x7D8499));
+            centered("Tip: run as administrator for the fast NTFS scan and to measure protected system folders (File > Restart as administrator).", Hex(0x7D8499));
         }
+        AddDropZone(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowWidth(), ImGui::GetWindowPos().y + ImGui::GetWindowHeight()), nullptr, Drop_Analyze);
     }
 
     // ===================================================================== status bar
@@ -428,7 +515,8 @@ namespace gex
         ImGui::Text("Total %s in %s files, %s folders", FormatSize(m_tree->root->size).c_str(),
             FormatCount(m_tree->root->fileCount).c_str(), FormatCount(m_tree->root->dirCount).c_str());
         ImGui::SameLine(); ImGui::TextDisabled("|"); ImGui::SameLine();
-        ImGui::TextDisabled("scanned in %.1fs", m_tree->scanSeconds);
+        ImGui::TextDisabled("%s in %.1fs", m_tree->usedMft ? "MFT scan" : "scanned", m_tree->scanSeconds);
+        if (m_tree->usedMft) ImGui::SetItemTooltip("Built from the NTFS master file table. Hard-linked files are counted once.");
         if (m_tree->scanErrors)
         {
             ImGui::SameLine();
@@ -597,6 +685,7 @@ namespace gex
             {
                 shell::DeleteItems(m_delPaths, recycle);
                 ValidatePaths(m_delPaths);
+                if (recycle) AfterRecycleBinChanged();
                 for (auto& p : m_delPaths)
                 {
                     auto it = m_recentIndex.find(p);
@@ -645,6 +734,43 @@ namespace gex
                         if (it != m_recentIndex.end()) m_recent[it->second].exists = false;
                     }
                 }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        // ---- empty Recycle Bin
+        if (m_openEmptyRb) { ImGui::OpenPopup("Empty Recycle Bin###emptyrb"); m_openEmptyRb = false; }
+        ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        if (ImGui::BeginPopupModal("Empty Recycle Bin###emptyrb", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            uint64_t size = m_rb.size, count = m_rb.count;
+            if (!m_rbEmptyRoot.empty())
+            {
+                size = count = 0;
+                for (size_t i = 0; i < m_rb.driveSize.size(); ++i)
+                    if (PathEquals(m_rb.driveSize[i].first, m_rbEmptyRoot)) { size = m_rb.driveSize[i].second; count = m_rb.driveCount[i].second; }
+            }
+            ImGui::TextColored(Hex(0xFF5C5C), "Permanently delete %s %s (%s) from the Recycle Bin%s%s?",
+                FormatCount(count).c_str(), count == 1 ? "item" : "items", FormatSize(size).c_str(),
+                m_rbEmptyRoot.empty() ? "" : " on ", m_rbEmptyRoot.empty() ? "" : ToUtf8(m_rbEmptyRoot).c_str());
+            if (m_rbEmptyRoot.empty() && m_rb.driveSize.size() > 1)
+                for (size_t i = 0; i < m_rb.driveSize.size(); ++i)
+                    ImGui::BulletText("%s  %s", ToUtf8(m_rb.driveSize[i].first).c_str(), FormatSize(m_rb.driveSize[i].second).c_str());
+            if (m_rbFuture.valid()) ImGui::TextDisabled("(updating numbers...)");
+            ImGui::TextDisabled("This frees the space on disk. It cannot be undone.");
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button, Hex(0x8A2B2B));
+            const bool go = ImGui::Button("Empty Recycle Bin", ImVec2(200 * m_uiScale, 0));
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            if (ImGui::Button("Open it first", ImVec2(140 * m_uiScale, 0))) { shell::OpenRecycleBin(); ImGui::CloseCurrentPopup(); }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(100 * m_uiScale, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) ImGui::CloseCurrentPopup();
+            if (go)
+            {
+                m_deferred = Deferred::EmptyRecycleBin;
+                m_deferredDir = m_rbEmptyRoot;
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();

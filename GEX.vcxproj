@@ -100,6 +100,7 @@
     <ClCompile Include="src\FileTypes.cpp" />
     <ClCompile Include="src\IconCache.cpp" />
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\MftReader.cpp" />
     <ClCompile Include="src\Scanner.cpp" />
     <ClCompile Include="src\ShellOps.cpp" />
     <ClCompile Include="src\Treemap.cpp" />
@@ -130,6 +131,7 @@
     <ClInclude Include="src\FileTypes.h" />
     <ClInclude Include="src\IconCache.h" />
     <ClInclude Include="src\Icons.h" />
+    <ClInclude Include="src\MftReader.h" />
     <ClInclude Include="src\Scanner.h" />
     <ClInclude Include="src\ShellOps.h" />
     <ClInclude Include="src\Treemap.h" />
